@@ -39,6 +39,7 @@ from ultralytics.nn.modules import (
     C3x,
     CBFuse,
     CBLinear,
+    CBAM,
     Classify,
     Concat,
     Conv,
@@ -1776,6 +1777,15 @@ def parse_model(d, ch, verbose=True):
             c2 = args[1] if args[3] else args[1] * 4
         elif m is torch.nn.BatchNorm2d:
             args = [ch[f]]
+        elif m is CBAM:
+            c2 = ch[f]
+            if len(args) == 1 and args[0] in {3, 7}:  # legacy shorthand: [kernel_size]
+                args = [c2, None, 16, args[0]]
+            elif len(args) <= 2:  # shorthand: [reduction, kernel_size]
+                args = [c2, None, *args]
+            else:  # explicit: [c2, reduction, kernel_size]
+                c2 = c2 if args[0] is None else args[0]
+                args = [ch[f], *args]
         elif m is Concat:
             c2 = sum(ch[x] for x in f)
         elif m in frozenset(

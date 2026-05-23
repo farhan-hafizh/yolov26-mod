@@ -38,6 +38,12 @@ profile: False # (bool) profile ONNX/TensorRT speeds during training for loggers
 freeze: # (int | list, optional) freeze first N layers (int) or specific layer indices (list)
 multi_scale: 0.0 # (float) multi-scale range as a fraction of imgsz; sizes are rounded to stride multiples
 compile: False # (bool | str) enable torch.compile() backend='inductor'; True="default", False=off, or "default|reduce-overhead|max-autotune-no-cudagraphs"
+box_loss: ciou # (str) bbox regression loss: ciou or inner_giou
+inner_giou_r_min: 0.50 # (float) minimum inner-box ratio for normal boxes
+inner_giou_r_max: 1.00 # (float) maximum inner-box ratio for normal boxes
+inner_giou_tiny_r_min: 0.80 # (float) minimum inner-box ratio for tiny boxes
+inner_giou_tiny_r_max: 1.00 # (float) maximum inner-box ratio for tiny boxes
+inner_giou_tiny_area_ratio: 0.05 # (float) tiny-object threshold relative to batch 95th-percentile GT area
 
 # Segmentation
 overlap_mask: True # (bool) merge instance masks into one mask during training (segment only)

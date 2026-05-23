@@ -110,10 +110,79 @@ class DFLoss(nn.Module):
 class BboxLoss(nn.Module):
     """Criterion class for computing training losses for bounding boxes."""
 
-    def __init__(self, reg_max: int = 16):
+    def __init__(
+        self,
+        reg_max: int = 16,
+        box_loss: str = "ciou",
+        inner_giou_r_min: float = 0.50,
+        inner_giou_r_max: float = 1.00,
+        inner_giou_tiny_r_min: float = 0.80,
+        inner_giou_tiny_r_max: float = 1.00,
+        inner_giou_tiny_area_ratio: float = 0.05,
+    ):
         """Initialize the BboxLoss module with regularization maximum and DFL settings."""
         super().__init__()
+        self.box_loss = box_loss.lower()
+        if self.box_loss not in {"ciou", "inner_giou"}:
+            raise ValueError(f"Unsupported box_loss={box_loss!r}. Expected 'ciou' or 'inner_giou'.")
         self.dfl_loss = DFLoss(reg_max) if reg_max > 1 else None
+        self.inner_giou_r_min = inner_giou_r_min
+        self.inner_giou_r_max = inner_giou_r_max
+        self.inner_giou_tiny_r_min = inner_giou_tiny_r_min
+        self.inner_giou_tiny_r_max = inner_giou_tiny_r_max
+        self.inner_giou_tiny_area_ratio = inner_giou_tiny_area_ratio
+        self.eps = 1e-7
+
+    @staticmethod
+    def _scale_box_about_center(boxes: torch.Tensor, ratio: torch.Tensor, eps: float) -> torch.Tensor:
+        """Scale xyxy boxes about their centers by ratio."""
+        center = (boxes[..., :2] + boxes[..., 2:]) / 2
+        wh = (boxes[..., 2:] - boxes[..., :2]).clamp(min=eps) * ratio
+        half_wh = wh / 2
+        return torch.cat((center - half_wh, center + half_wh), -1)
+
+    def _inner_giou_ratio(
+        self, iou: torch.Tensor, target_bboxes: torch.Tensor, stride: torch.Tensor | None = None
+    ) -> torch.Tensor:
+        """Compute adaptive inner-box ratio with tiny-object safeguard."""
+        area_boxes = target_bboxes if stride is None else target_bboxes * stride
+        target_wh = (area_boxes[..., 2:] - area_boxes[..., :2]).clamp(min=0)
+        target_area = target_wh.prod(-1, keepdim=True)
+        valid_area = target_area[torch.isfinite(target_area)]
+        area_ref = (
+            torch.quantile(valid_area.float().flatten(), 0.95).to(target_area.dtype) + self.eps
+            if valid_area.numel()
+            else target_area.new_tensor(1.0)
+        )
+        tiny = target_area / area_ref < self.inner_giou_tiny_area_ratio
+
+        normal_min = torch.full_like(iou, self.inner_giou_r_min)
+        normal_max = torch.full_like(iou, self.inner_giou_r_max)
+        tiny_min = torch.full_like(iou, self.inner_giou_tiny_r_min)
+        tiny_max = torch.full_like(iou, self.inner_giou_tiny_r_max)
+        r_min = torch.where(tiny, tiny_min, normal_min)
+        r_max = torch.where(tiny, tiny_max, normal_max)
+        return r_max - (r_max - r_min) * iou.detach().clamp(0, 1)
+
+    def _inner_giou_loss(
+        self, pred_bboxes: torch.Tensor, target_bboxes: torch.Tensor, stride: torch.Tensor | None = None
+    ) -> torch.Tensor:
+        """Compute adaptive Inner-GIoU loss for xyxy boxes."""
+        iou = bbox_iou(pred_bboxes, target_bboxes, xywh=False, eps=self.eps)
+        giou = bbox_iou(pred_bboxes, target_bboxes, xywh=False, GIoU=True, eps=self.eps)
+        ratio = self._inner_giou_ratio(iou, target_bboxes, stride)
+        pred_inner = self._scale_box_about_center(pred_bboxes, ratio, self.eps)
+        target_inner = self._scale_box_about_center(target_bboxes, ratio, self.eps)
+
+        inner_lt = pred_inner[..., :2].maximum(target_inner[..., :2])
+        inner_rb = pred_inner[..., 2:].minimum(target_inner[..., 2:])
+        inner_wh = (inner_rb - inner_lt).clamp(min=0)
+        inner_inter = inner_wh.prod(-1, keepdim=True)
+        pred_inner_area = (pred_inner[..., 2:] - pred_inner[..., :2]).clamp(min=0).prod(-1, keepdim=True)
+        target_inner_area = (target_inner[..., 2:] - target_inner[..., :2]).clamp(min=0).prod(-1, keepdim=True)
+        inner_union = pred_inner_area + target_inner_area - inner_inter + self.eps
+        inner_iou = inner_inter / inner_union
+        return 1.0 - giou + iou - inner_iou
 
     def forward(
         self,
@@ -129,8 +198,13 @@ class BboxLoss(nn.Module):
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Compute IoU and DFL losses for bounding boxes."""
         weight = target_scores.sum(-1)[fg_mask].unsqueeze(-1)
-        iou = bbox_iou(pred_bboxes[fg_mask], target_bboxes[fg_mask], xywh=False, CIoU=True)
-        loss_iou = ((1.0 - iou) * weight).sum() / target_scores_sum
+        if self.box_loss == "inner_giou":
+            stride_fg = stride.view(1, -1, 1).expand(target_bboxes.shape[0], -1, 1)[fg_mask]
+            box_loss = self._inner_giou_loss(pred_bboxes[fg_mask], target_bboxes[fg_mask], stride_fg)
+        else:
+            iou = bbox_iou(pred_bboxes[fg_mask], target_bboxes[fg_mask], xywh=False, CIoU=True)
+            box_loss = 1.0 - iou
+        loss_iou = (box_loss * weight).sum() / target_scores_sum
 
         # DFL loss
         if self.dfl_loss:
@@ -365,7 +439,15 @@ class v8DetectionLoss:
             stride=self.stride.tolist(),
             topk2=tal_topk2,
         )
-        self.bbox_loss = BboxLoss(m.reg_max).to(device)
+        self.bbox_loss = BboxLoss(
+            m.reg_max,
+            box_loss=getattr(h, "box_loss", "ciou"),
+            inner_giou_r_min=getattr(h, "inner_giou_r_min", 0.50),
+            inner_giou_r_max=getattr(h, "inner_giou_r_max", 1.00),
+            inner_giou_tiny_r_min=getattr(h, "inner_giou_tiny_r_min", 0.80),
+            inner_giou_tiny_r_max=getattr(h, "inner_giou_tiny_r_max", 1.00),
+            inner_giou_tiny_area_ratio=getattr(h, "inner_giou_tiny_area_ratio", 0.05),
+        ).to(device)
         self.proj = torch.arange(m.reg_max, dtype=torch.float, device=device)
 
     def preprocess(self, targets: torch.Tensor, batch_size: int, scale_tensor: torch.Tensor) -> torch.Tensor:

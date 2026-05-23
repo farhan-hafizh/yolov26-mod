@@ -210,6 +210,11 @@ CFG_FRACTION_KEYS = frozenset(
         "iou",
         "fraction",
         "multi_scale",
+        "inner_giou_r_min",
+        "inner_giou_r_max",
+        "inner_giou_tiny_r_min",
+        "inner_giou_tiny_r_max",
+        "inner_giou_tiny_area_ratio",
     }
 )
 CFG_INT_KEYS = frozenset(

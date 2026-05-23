@@ -285,6 +285,16 @@ def test_all_model_yamls():
             YOLO(m.name)
 
 
+def test_yolo26x_mod_model():
+    """Test modified YOLO26x model creation and CBAM wiring."""
+    model = YOLO("yolo26x-mod.yaml")
+    cbam_count = sum(m.__class__.__name__ == "CBAM" for m in model.model.modules())
+
+    assert cbam_count == 4
+    with torch.no_grad():
+        model.model(torch.zeros(1, 3, 64, 64))
+
+
 @pytest.mark.skipif(WINDOWS, reason="Windows slow CI export bug https://github.com/ultralytics/ultralytics/pull/16003")
 def test_workflow():
     """Test the complete workflow including training, validation, prediction, and exporting."""
@@ -659,6 +669,43 @@ def test_nn_modules_conv():
     m = Conv2(c1, c2)
     m.fuse_convs()
     m(x)
+
+
+def test_inner_giou_bbox_loss():
+    """Test opt-in adaptive Inner-GIoU bbox loss and tiny-object ratio policy."""
+    from ultralytics.utils.loss import BboxLoss
+
+    pred_dist = torch.ones(1, 2, 4)
+    pred_bboxes = torch.tensor([[[0.0, 0.0, 1.0, 1.0], [0.0, 0.0, 100.0, 100.0]]])
+    target_bboxes = torch.tensor([[[0.0, 0.0, 1.0, 1.0], [0.0, 0.0, 100.0, 100.0]]])
+    target_scores = torch.ones(1, 2, 1)
+    fg_mask = torch.tensor([[True, True]])
+    anchor_points = torch.tensor([[0.5, 0.5], [50.0, 50.0]])
+    stride = torch.ones(2, 1)
+    imgsz = torch.tensor([128.0, 128.0])
+    target_scores_sum = target_scores.sum()
+
+    ciou_loss = BboxLoss(reg_max=1)
+    default_loss = BboxLoss(reg_max=1, box_loss="ciou")
+    ciou_box, ciou_dfl = ciou_loss(
+        pred_dist, pred_bboxes, anchor_points, target_bboxes, target_scores, target_scores_sum, fg_mask, imgsz, stride
+    )
+    default_box, default_dfl = default_loss(
+        pred_dist, pred_bboxes, anchor_points, target_bboxes, target_scores, target_scores_sum, fg_mask, imgsz, stride
+    )
+
+    assert torch.allclose(default_box, ciou_box)
+    assert torch.allclose(default_dfl, ciou_dfl)
+
+    inner_loss = BboxLoss(reg_max=1, box_loss="inner_giou")
+    inner_box, inner_dfl = inner_loss(
+        pred_dist, pred_bboxes, anchor_points, target_bboxes, target_scores, target_scores_sum, fg_mask, imgsz, stride
+    )
+    ratios = inner_loss._inner_giou_ratio(torch.ones(2, 1), target_bboxes[0])
+
+    assert torch.isfinite(inner_box)
+    assert torch.isfinite(inner_dfl)
+    assert torch.allclose(ratios.squeeze(), torch.tensor([0.80, 0.50]))
 
 
 def test_nn_modules_block():
